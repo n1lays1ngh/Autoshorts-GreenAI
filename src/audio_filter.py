@@ -40,8 +40,10 @@ def apply_nms(windows):
     return merged_windows
 
 
-def calculate_spectral_flux(audio_path):
-    print(f"[*] Analyzing Acoustic Spectrum: {os.path.basename(audio_path)}")
+# THE FIX 1: Added 'threshold=0.6' as a dynamic parameter here
+def calculate_spectral_flux(audio_path, threshold=0.6):
+    # THE FIX 2: Updated the print statement so you can see which threshold is running
+    print(f"[*] Analyzing Acoustic Spectrum: {os.path.basename(audio_path)} (Threshold: {threshold})")
 
     y, sr = librosa.load(audio_path, sr=16000)
     total_duration = librosa.get_duration(y=y, sr=sr)
@@ -58,9 +60,11 @@ def calculate_spectral_flux(audio_path):
     else:
         flux_normalized = flux
 
-    # INCREASED THRESHOLD: Only look for the biggest laughs (changed 0.3 to 0.4)
+    # INCREASED THRESHOLD: Only look for the biggest laughs
     min_dist_frames = int((sr / hop_length) * 15)
-    peaks, _ = find_peaks(flux_normalized, height=0.6, distance=min_dist_frames)
+
+    # THE FIX 3: Replaced the hardcoded 0.6 with the dynamic 'threshold' variable
+    peaks, _ = find_peaks(flux_normalized, height=threshold, distance=min_dist_frames)
 
     peak_times = librosa.frames_to_time(peaks, sr=sr, hop_length=hop_length)
 
