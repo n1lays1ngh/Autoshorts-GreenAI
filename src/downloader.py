@@ -53,7 +53,7 @@ def fetch_media(youtube_url: str, output_directory: str, file_prefix: str = "tar
 
 if __name__ == "__main__":
     # Using your provided URL
-    test_url = "https://www.youtube.com/watch?v=PPjYWaqCffQ"
+    test_url ='https://www.youtube.com/watch?v=HxjDgR8itZM'
 
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

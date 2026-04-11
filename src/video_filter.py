@@ -6,10 +6,36 @@ import numpy as np
 
 def calculate_laplacian_variance(frame):
     """
-    Computes Var(∇²I) to detect blurry or black frames.
+    Grid-based Variance: Slices the frame into a 3x3 grid and returns the
+    maximum variance found in any single block. Finds the subject anywhere.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var()
+    h, w = gray.shape
+
+    # Calculate dimensions of the 9 blocks
+    block_h, block_w = h // 3, w // 3
+
+    max_score = 0.0
+
+    # Loop through the 3x3 grid
+    for row in range(3):
+        for col in range(3):
+            # Crop the current block
+            y_start = row * block_h
+            y_end = (row + 1) * block_h
+            x_start = col * block_w
+            x_end = (col + 1) * block_w
+
+            block = gray[y_start:y_end, x_start:x_end]
+
+            # Score just this block
+            score = cv2.Laplacian(block, cv2.CV_64F).var()
+
+            # Keep the highest score found
+            if score > max_score:
+                max_score = score
+
+    return max_score
 
 
 def filter_visual_quality(video_path, manifest_path, threshold=250.0):
