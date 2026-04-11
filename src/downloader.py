@@ -2,60 +2,63 @@ import os
 import yt_dlp
 
 
-def fetch_audio_stream(youtube_url: str, output_directory: str, file_prefix: str = "raw_source") -> str:
+def fetch_media(youtube_url: str, output_directory: str, file_prefix: str = "target_video") -> str:
     """
-    Downloads only the best available audio stream from a YouTube video
-    and converts it to a WAV format for DSP analysis.
-
-    Args:
-        youtube_url (str): The link to the source video.
-        output_directory (str): Where to save the file (e.g., data/raw_audio/).
-        file_prefix (str): The name of the file before the .wav extension.
-
-    Returns:
-        str: The absolute path to the downloaded .wav file, or None if it fails.
+    Downloads 720p video and best audio, merging them into an MP4.
+    Also ensures the audio is available for the Spectral Flux analysis.
     """
-    # 1. Ensure our target directory exists
+    # 1. Ensure target directory exists
     os.makedirs(output_directory, exist_ok=True)
 
-    # 2. Define the exact output path structure
+    # 2. Define output paths
+    # We save to data/raw_video/ now as it's our master source
     output_template = os.path.join(output_directory, f'{file_prefix}.%(ext)s')
-    final_wav_path = os.path.join(output_directory, f'{file_prefix}.wav')
 
-    # 3. Configure yt-dlp to prioritize audio and force WAV conversion
     ydl_options = {
-        'format': 'bestaudio/best',
+        # 1. Reject AV1/VP9 completely. FORCE H.264 (avc) and AAC.
+        'format': 'bestvideo[vcodec^=avc][height<=720]+bestaudio[ext=m4a]/best[vcodec^=avc]/best',
+        'merge_output_format': 'mp4',
         'outtmpl': output_template,
+
+        # 2. Extract the WAV for librosa
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'wav',
-            'preferredquality': '192',  # 192kbps is plenty for our 300-3000Hz analysis
+            'preferredquality': '192',
         }],
-        'quiet': False,  # Keep this False so we can see the download progress in terminal
+
+        'keepvideo': True,
+        'quiet': False,
         'no_warnings': True
     }
 
-    print(f"[*] Initializing smart download for: {youtube_url}")
+
+    print(f"[*] Initializing Green AI Ingestion for: {youtube_url}")
 
     try:
         with yt_dlp.YoutubeDL(ydl_options) as ydl:
             ydl.download([youtube_url])
 
-        print(f"[+] Success! Audio extracted and saved to: {final_wav_path}")
-        return final_wav_path
+        final_mp4 = os.path.join(output_directory, f"{file_prefix}.mp4")
+        final_wav = os.path.join(output_directory, f"{file_prefix}.wav")
+
+        print(f"[+] Success! Master MP4: {final_mp4}")
+        print(f"[+] Success! Analysis WAV: {final_wav}")
+        return final_mp4
 
     except Exception as e:
-        print(f"[-] Error downloading audio: {e}")
+        print(f"[-] Error during media ingestion: {e}")
         return None
 
 
-# Simple block to let us test this specific file in isolation
 if __name__ == "__main__":
-    # A short, 30-second copyright-free sound effect video for rapid testing
-    test_url = "https://www.youtube.com/watch?v=2PYpGGn4l7s"
+    # Using your provided URL
+    test_url = "https://www.youtube.com/watch?v=PPjYWaqCffQ"
 
-    # Navigate up one level from 'src' to find the 'data/raw_audio' folder
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    target_dir = os.path.join(base_dir, "data", "raw_audio")
 
-    fetch_audio_stream(test_url, target_dir, "system_test_audio")
+    # We will store the master files in data/raw_video
+    # The audio filter can point here to get the .wav
+    target_dir = os.path.join(base_dir, "data", "raw_video")
+
+    fetch_media(test_url, target_dir, "system_test_media")
