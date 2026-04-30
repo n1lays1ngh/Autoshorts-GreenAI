@@ -1,120 +1,136 @@
+"""
+video_filter.py — Green AI Cascade v1
+======================================
+Visual quality gate using Laplacian sharpness + optional face detection.
+Accepts window list directly (no manifest file I/O) so batch_runner
+can pass windows in-memory without hitting disk.
+"""
+
 import cv2
 import json
 import os
 import numpy as np
 
+# Load face detector once at module level
+_FACE_CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+_face_cascade      = cv2.CascadeClassifier(_FACE_CASCADE_PATH)
+
 
 def calculate_laplacian_variance(frame):
     """
-    Grid-based Variance: Slices the frame into a 3x3 grid and returns the
-    maximum variance found in any single block. Finds the subject anywhere.
+    Grid-based sharpness: splits frame into 3x3 blocks,
+    returns max Laplacian variance across all blocks.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
+    gray        = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w        = gray.shape
+    block_h     = h // 3
+    block_w     = w // 3
+    max_score   = 0.0
 
-    # Calculate dimensions of the 9 blocks
-    block_h, block_w = h // 3, w // 3
-
-    max_score = 0.0
-
-    # Loop through the 3x3 grid
     for row in range(3):
         for col in range(3):
-            # Crop the current block
-            y_start = row * block_h
-            y_end = (row + 1) * block_h
-            x_start = col * block_w
-            x_end = (col + 1) * block_w
-
-            block = gray[y_start:y_end, x_start:x_end]
-
-            # Score just this block
+            block = gray[row * block_h:(row + 1) * block_h,
+                         col * block_w:(col + 1) * block_w]
             score = cv2.Laplacian(block, cv2.CV_64F).var()
-
-            # Keep the highest score found
             if score > max_score:
                 max_score = score
-
     return max_score
 
 
-def filter_visual_quality(video_path, manifest_path, threshold=250.0):
+def calculate_face_score(frame):
     """
-    Final Gatekeeper: Prunes windows where the punchline moment is visually
-    non-salient (dark/blurry).
+    Returns a face confidence multiplier:
+      1.0 — face detected
+      0.5 — no face but frame is bright (performer may be off-centre)
+      0.0 — dark / no face (likely a cut or b-roll)
     """
-    if not os.path.exists(manifest_path):
-        print(f"[-] Error: Manifest not found at {manifest_path}")
-        return
+    gray            = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mean_brightness = np.mean(gray)
+    faces           = _face_cascade.detectMultiScale(
+        gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
+    )
+    if len(faces) > 0:
+        return 1.0
+    elif mean_brightness > 40:
+        return 0.5
+    else:
+        return 0.0
 
-    with open(manifest_path, 'r') as f:
-        windows = json.load(f)
 
+def score_frame(frame, use_face_detection=True):
+    """Combined visual score: sharpness x face_multiplier."""
+    sharpness = calculate_laplacian_variance(frame)
+    if use_face_detection:
+        face_mult = calculate_face_score(frame)
+        return sharpness * face_mult, round(sharpness, 2), round(face_mult, 2)
+    return sharpness, round(sharpness, 2), 1.0
+
+
+def filter_visual_quality(video_path, windows, threshold=250.0,
+                           use_face_detection=True):
+    """
+    Parameters
+    ----------
+    video_path         : path to .mp4 file
+    windows            : list of window dicts from audio_filter
+    threshold          : minimum combined visual score to keep a window
+    use_face_detection : toggle for ablation study
+
+    Returns
+    -------
+    Filtered list of windows with visual_score, sharpness, face_score added.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"[-] Error: Could not open video file {video_path}")
-        return
+        print(f"[-] Could not open video: {video_path}")
+        return []
 
-    # Metadata for metrics
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_duration_sec = total_frames / fps
+    fps            = cap.get(cv2.CAP_PROP_FPS)
+    total_frames   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_duration = total_frames / fps if fps > 0 else 0
 
     valid_windows = []
-    print(f"[*] Starting Visual Cascade on {len(windows)} candidates...")
+    face_tag      = 'on' if use_face_detection else 'off'
+    print(f"[*] Visual {len(windows)} windows | "
+          f"threshold={threshold} | face={face_tag}")
 
     for i, w in enumerate(windows):
         peak_time = w['peak_time']
-
-        # Jump to the peak frame (the punchline)
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(peak_time * fps))
         ret, frame = cap.read()
 
         if not ret:
+            print(f"    [!] Cannot read frame at {peak_time}s — skipping")
             continue
 
-        score = calculate_laplacian_variance(frame)
+        combined, sharpness, face_mult = score_frame(frame, use_face_detection)
 
-        if score > threshold:
-            w['visual_score'] = round(score, 2)
+        if combined > threshold:
+            w = dict(w)   # don't mutate caller's list
+            w['visual_score'] = round(combined,   2)
+            w['sharpness']    = sharpness
+            w['face_score']   = face_mult
             valid_windows.append(w)
-            print(f"    [+] Keep {i}: Score {score:.1f} (Clear)")
+            print(f"    [+] Keep {i}: combined={combined:.1f} "
+                  f"sharp={sharpness} face={face_mult}")
         else:
-            print(f"    [-] Drop {i}: Score {score:.1f} (Blurry/Dark)")
+            print(f"    [-] Drop {i}: combined={combined:.1f} "
+                  f"sharp={sharpness} face={face_mult}")
 
     cap.release()
-
-    # --- THE PRUNING REPORT ---
-    original_duration = video_duration_sec
-    # Calculate unique seconds to be processed by GPU (accounts for overlaps)
-    # We create a set of all second-integers covered by valid windows
-    gpu_seconds_set = set()
-    for w in valid_windows:
-        for sec in range(int(w['start']), int(w['end'])):
-            gpu_seconds_set.add(sec)
-
-    gpu_duration = len(gpu_seconds_set)
-    pruning_ratio = (1 - (gpu_duration / original_duration)) * 100
-
-    print(f"\n" + "=" * 45)
-    print(f"      GREEN AI CASCADE: PRUNING REPORT")
-    print(f"=" * 45)
-    print(f"Raw Video Duration:   {original_duration / 60:.2f} mins")
-    print(f"GPU Workload:         {gpu_duration / 60:.2f} mins")
-    print(f"Efficiency Gain:      {pruning_ratio:.1f}% PRUNED")
-    print(f"Status:               {len(valid_windows)} Windows Ready for A100")
-    print(f"=" * 45)
-
-    # Save the cleaned manifest
-    with open(manifest_path, 'w') as f:
-        json.dump(valid_windows, f, indent=4)
+    return valid_windows
 
 
 if __name__ == "__main__":
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base_dir   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    video_id   = "wQA68Oqr1qE"
+    video_path = os.path.join(base_dir, "data", "research_dataset",
+                              "mp4", f"{video_id}.mp4")
+    manifest   = os.path.join(base_dir, "data", "candidate_windows",
+                              f"{video_id}_candidates.json")
 
-    # Path to the 720p video from downloader.py
-    video_file = os.path.join(base_dir, "data", "raw_video", "system_test_media.mp4")
-    manifest = os.path.join(base_dir, "data", "candidate_windows.json")
+    with open(manifest) as f:
+        windows = json.load(f)
 
-    filter_visual_quality(video_file, manifest)
+    valid = filter_visual_quality(video_path, windows)
+    print(f"\n[+] {len(valid)} windows passed visual filter.")

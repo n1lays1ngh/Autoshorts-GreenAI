@@ -1,0 +1,5 @@
+window_config,window_lead,window_tail,window_total,mean_recall,std_recall,mean_noise,std_noise,mean_pruned,std_pruned,mean_recall_delta_vs_random,mean_recall_delta_vs_uniform,wilcoxon_p_vs_random,wilcoxon_p_vs_uniform,wilcoxon_p_vs_original_60s,n_videos
+minimal_20s,15,5,20,38.41,24.39,66.07,24.33,65.92,24.48,15.88,7.76,0.0007,0.0109,0.001,32
+tight_25s,20,5,25,45.53,30.94,59.78,23.93,60.62,27.49,22.55,16.86,0.0005,0.0018,0.0036,32
+compact_40s,30,10,40,53.26,37.76,41.06,30.8,52.71,34.29,34.04,33.44,0.0001,0.0001,0.2898,32
+original_60s,45,15,60,54.93,38.88,26.77,34.39,48.48,36.6,35.5,33.64,0.0001,0.0001,1.0,32

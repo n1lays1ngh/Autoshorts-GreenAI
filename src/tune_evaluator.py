@@ -1,122 +1,202 @@
-import yt_dlp
+"""
+tune_evaluator.py — Green AI Cascade v1
+=========================================
+Evaluates candidate windows against YouTube heatmap ground truth.
+Accepts windows as a list (no manifest file I/O) for in-memory batch running.
+Also computes random and uniform baseline scores for statistical comparison.
+"""
+
 import json
 import os
+import numpy as np
+
+_SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 
 
-def fetch_youtube_data(youtube_url):
+# ── Baseline window generators ────────────────────────────────────────────────
+
+def generate_random_windows(duration_secs, n_windows, window_lead=45.0,
+                             window_tail=15.0, seed=42):
+    """Random baseline: n_windows placed randomly across the video body."""
+    rng     = np.random.default_rng(seed)
+    windows = []
+    for _ in range(n_windows):
+        peak  = rng.uniform(60.0, max(61.0, duration_secs - window_tail))
+        start = max(0.0, peak - window_lead)
+        end   = min(duration_secs, peak + window_tail)
+        windows.append({
+            "peak_time": round(float(peak), 2),
+            "start":     round(float(start), 2),
+            "end":       round(float(end), 2),
+            "duration":  round(float(end - start), 2),
+        })
+    return windows
+
+
+def generate_uniform_windows(duration_secs, n_windows, window_lead=45.0,
+                              window_tail=15.0):
+    """Uniform baseline: evenly spaced windows across the video body."""
+    if n_windows == 0:
+        return []
+    body_start = 60.0
+    body_end   = duration_secs - window_tail
+    if body_end <= body_start:
+        return []
+
+    step    = (body_end - body_start) / n_windows
+    windows = []
+    for i in range(n_windows):
+        peak  = body_start + i * step + step / 2
+        start = max(0.0, peak - window_lead)
+        end   = min(duration_secs, peak + window_tail)
+        windows.append({
+            "peak_time": round(float(peak), 2),
+            "start":     round(float(start), 2),
+            "end":       round(float(end), 2),
+            "duration":  round(float(end - start), 2),
+        })
+    return windows
+
+
+# ── Core evaluator ────────────────────────────────────────────────────────────
+
+def evaluate_pipeline(video_id, ai_windows, top_percentile=0.10):
     """
-    Extracts the heatmap AND the total video duration.
+    Evaluates ai_windows against YouTube heatmap for video_id.
+
+    Parameters
+    ----------
+    video_id      : YouTube video ID string
+    ai_windows    : list of window dicts from audio+visual pipeline
+    top_percentile: fraction of heatmap segments treated as "viral"
+
+    Returns
+    -------
+    Dict of metrics for AI pipeline + random and uniform baselines.
+    None if heatmap or index is missing.
     """
-    print(f"[*] Fetching crowd-sourced Heatmap data for: {youtube_url} ...")
-    ydl_opts = {
-        'quiet': True,
-        'skip_download': True,
-        'no_warnings': True
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=False)
-        heatmap = info.get('heatmap')
-        duration = info.get('duration')  # Get raw video length in seconds
-
-        if not heatmap:
-            print("[-] No heatmap data available for this video.")
-            return None, duration
-        return heatmap, duration
-
-
-def evaluate_pipeline(youtube_url, manifest_path, top_percentile=0.10):
-    if not os.path.exists(manifest_path):
-        print(f"[-] Error: Manifest not found at {manifest_path}.")
+    heatmap_path = os.path.join(
+        _PROJECT_ROOT, "data", "research_dataset",
+        "heatmaps", f"{video_id}_heatmap.json"
+    )
+    if not os.path.exists(heatmap_path):
+        print(f"[-] Heatmap not found: {heatmap_path}")
         return None
 
-    with open(manifest_path, 'r') as f:
-        ai_windows = json.load(f)
+    with open(heatmap_path) as f:
+        heatmap_data = json.load(f)
 
-    # 1. Grab both heatmap and raw duration
-    heatmap_data, raw_duration = fetch_youtube_data(youtube_url)
-    if not heatmap_data:
+    index_path = os.path.join(_PROJECT_ROOT, "data", "research_dataset", "index.json")
+    with open(index_path) as f:
+        index = json.load(f)
+
+    raw_duration = index.get(video_id, {}).get("duration_secs", 0)
+    if raw_duration == 0:
+        print(f"[-] duration_secs missing for {video_id}")
         return None
 
-    # 2. Calculate Pruning Percentage (Efficiency)
-    total_gpu_seconds = sum(w['duration'] for w in ai_windows)
-    pruned_pct = 0.0
-    if raw_duration and raw_duration > 0:
-        pruned_pct = max(0.0, 100.0 - ((total_gpu_seconds / raw_duration) * 100))
-
-    # 3. Filter out the fake intro data completely (first 60 seconds)
-    valid_body_segments = [s for s in heatmap_data if s['start_time'] > 60.0]
-
-    if not valid_body_segments:
-        print("[-] No heatmap data exists past the 60-second mark.")
+    # ── Filter intro (Anomaly 1) ──────────────────────────────────────────────
+    valid_body = [s for s in heatmap_data if s['start_time'] > 60.0]
+    if not valid_body:
+        print(f"[-] No heatmap data after 60s for {video_id}")
         return None
 
-    # 4. Extract all values and sort them to find the percentile threshold
-    values = [s['value'] for s in valid_body_segments]
-    values.sort(reverse=True)
-
-    threshold_index = max(1, int(len(values) * top_percentile)) - 1
+    # ── Dynamic percentile threshold (Anomaly 2) ──────────────────────────────
+    values            = sorted([s['value'] for s in valid_body], reverse=True)
+    threshold_index   = max(1, int(len(values) * top_percentile)) - 1
     dynamic_threshold = values[threshold_index]
 
-    # 5. Isolate the "Viral Peaks"
-    true_viral_moments = []
-    for segment in valid_body_segments:
-        if segment['value'] >= dynamic_threshold:
-            peak_time = (segment['start_time'] + segment['end_time']) / 2
-            true_viral_moments.append(peak_time)
+    true_viral_moments = [
+        (s['start_time'] + s['end_time']) / 2
+        for s in valid_body
+        if s['value'] >= dynamic_threshold
+    ]
 
-    # 6. Grade the AI
-    captured_peaks = 0
-    missed_peaks = []
-    for true_peak in true_viral_moments:
-        is_captured = any(w['start'] <= true_peak <= w['end'] for w in ai_windows)
-        if is_captured:
-            captured_peaks += 1
-        else:
-            missed_peaks.append(round(true_peak, 2))
+    # ── Shared scoring function ───────────────────────────────────────────────
+    def score_windows(windows, true_peaks, duration):
+        captured  = 0
+        missed    = []
+        for tp in true_peaks:
+            if any(w['start'] <= tp <= w['end'] for w in windows):
+                captured += 1
+            else:
+                missed.append(round(tp, 2))
 
-    total_true_peaks = len(true_viral_moments)
-    capture_rate = (captured_peaks / max(total_true_peaks, 1)) * 100
+        total     = len(true_peaks)
+        recall    = (captured / max(total, 1)) * 100
+        useful    = sum(
+            1 for w in windows
+            if any(w['start'] <= tp <= w['end'] for tp in true_peaks)
+        )
+        noise     = ((len(windows) - useful) / max(len(windows), 1)) * 100
+        gpu_secs  = sum(w['duration'] for w in windows)
+        pruned    = max(0.0, 100.0 - (gpu_secs / duration * 100))
 
-    useful_ai_windows = 0
-    for w in ai_windows:
-        has_peak = any(w['start'] <= tp <= w['end'] for tp in true_viral_moments)
-        if has_peak:
-            useful_ai_windows += 1
+        return {
+            "captured":   captured,
+            "missed":     len(missed),
+            "missed_at":  missed,
+            "recall_pct": round(recall,  1),
+            "noise_pct":  round(noise,   1),
+            "pruned_pct": round(pruned,  1),
+            "n_windows":  len(windows),
+        }
 
-    noise_rate = ((len(ai_windows) - useful_ai_windows) / max(len(ai_windows), 1)) * 100
+    # ── Infer window geometry from first AI window (for fair baselines) ───────
+    window_lead = ai_windows[0].get("window_lead", 45.0) if ai_windows else 45.0
+    window_tail = ai_windows[0].get("window_tail", 15.0) if ai_windows else 15.0
 
-    # 7. Print the Tuning Report
-    print(f"\n" + "=" * 50)
-    print(f"      SMART HYPERPARAMETER TUNING REPORT")
-    print(f"=" * 50)
-    print(f"Ground Truth (Top {int(top_percentile * 100)}% YouTube Peaks): {total_true_peaks}")
-    print(f"AI Candidate Windows:                  {len(ai_windows)}")
-    print(f"-" * 50)
-    print(f"✅ True Positives Captured:            {captured_peaks}")
-    print(f"❌ Viral Moments Missed:               {len(missed_peaks)}")
-    print(f"🎯 Capture Rate (Recall):              {capture_rate:.1f}%")
-    print(f"🗑️  AI 'Noise' Rate:                     {noise_rate:.1f}%")
-    print(f"✂️  Efficiency (Pruned):                 {pruned_pct:.1f}%")
-    print(f"=" * 50)
+    ai_scores   = score_windows(ai_windows, true_viral_moments, raw_duration)
 
-    # 8. Return the full dictionary (INCLUDING pruned_pct) back to batch_runner.py
+    # Baselines use same n_windows and same window geometry as AI
+    n_windows       = max(len(ai_windows), 1)
+    rand_windows    = generate_random_windows(raw_duration, n_windows,
+                                              window_lead, window_tail)
+    uniform_windows = generate_uniform_windows(raw_duration, n_windows,
+                                               window_lead, window_tail)
+    rand_scores     = score_windows(rand_windows,    true_viral_moments, raw_duration)
+    uniform_scores  = score_windows(uniform_windows, true_viral_moments, raw_duration)
+
+    print(f"  [EVAL] {video_id} | "
+          f"AI R={ai_scores['recall_pct']}% "
+          f"N={ai_scores['noise_pct']}% "
+          f"E={ai_scores['pruned_pct']}% | "
+          f"rand R={rand_scores['recall_pct']}% | "
+          f"uniform R={uniform_scores['recall_pct']}%")
+
     return {
-        "true_peaks": total_true_peaks,
-        "ai_windows": len(ai_windows),
-        "captured": captured_peaks,
-        "missed": len(missed_peaks),
-        "recall_pct": round(capture_rate, 1),
-        "noise_pct": round(noise_rate, 1),
-        "pruned_pct": round(pruned_pct, 1)
+        "video_id":            video_id,
+        "true_peaks":          len(true_viral_moments),
+        "duration_secs":       raw_duration,
+        "window_lead":         window_lead,
+        "window_tail":         window_tail,
+        # AI
+        "ai_windows":          ai_scores["n_windows"],
+        "captured":            ai_scores["captured"],
+        "missed":              ai_scores["missed"],
+        "missed_at":           ai_scores["missed_at"],
+        "recall_pct":          ai_scores["recall_pct"],
+        "noise_pct":           ai_scores["noise_pct"],
+        "pruned_pct":          ai_scores["pruned_pct"],
+        # Baselines
+        "rand_recall_pct":     rand_scores["recall_pct"],
+        "rand_noise_pct":      rand_scores["noise_pct"],
+        "rand_pruned_pct":     rand_scores["pruned_pct"],
+        "uniform_recall_pct":  uniform_scores["recall_pct"],
+        "uniform_noise_pct":   uniform_scores["noise_pct"],
+        "uniform_pruned_pct":  uniform_scores["pruned_pct"],
     }
 
 
 if __name__ == "__main__":
-    # Test URL (Gaurav Kapoor Standup)
-    test_url = "https://www.youtube.com/watch?v=MoBkkw66NWY"
-
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    manifest = os.path.join(base_dir, "data", "candidate_windows.json")
-
-    evaluate_pipeline(test_url, manifest, top_percentile=0.10)
+    video_id = "wQA68Oqr1qE"
+    manifest = os.path.join(_PROJECT_ROOT, "data", "candidate_windows",
+                            f"{video_id}_candidates.json")
+    with open(manifest) as f:
+        windows = json.load(f)
+    result = evaluate_pipeline(video_id, windows, top_percentile=0.10)
+    if result:
+        print(f"\nRecall: {result['recall_pct']}%  "
+              f"Noise: {result['noise_pct']}%  "
+              f"Pruned: {result['pruned_pct']}%")
